@@ -1,11 +1,5 @@
-Don't use this
+Convenience working out of the box function for listening to postgres notifications
 
-stuff adopted from tokio-postgres tests
+Code adopted from tokio-postgres tests and the potential sync implementation
 
-# Where is my psql port tho?
-
-```
-SELECT *
-FROM pg_settings
-WHERE name = 'port';
-```
+Use at your own risk
