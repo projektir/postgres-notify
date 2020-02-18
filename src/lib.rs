@@ -1,5 +1,6 @@
 use futures::{future, stream, StreamExt};
-use tokio_postgres::{AsyncMessage, Client, Config, NoTls};
+use tokio_postgres::{AsyncMessage, Client, Config, Socket};
+use tokio_postgres::tls::MakeTlsConnect;
 
 #[derive(Debug)]
 pub enum PsqlNotifyError {
@@ -19,15 +20,19 @@ impl From<tokio_postgres::error::Error> for PsqlNotifyError {
     }
 }
 
-pub async fn notify_listen<F>(
+pub async fn notify_listen<T, F>(
     execute_string: &str,
     config: &Config,
+    tls: T,
     mut notify_fn: F,
 ) -> Result<Client, PsqlNotifyError>
 where
+    T: MakeTlsConnect<Socket> + 'static + Send,
+    T::TlsConnect: Send,
+    T::Stream: Send,
     F: FnMut(AsyncMessage) + Send + 'static,
 {
-    let (client, mut connection) = config.connect(NoTls).await?;
+    let (client, mut connection) = config.connect(tls).await?;
     let connection = stream::poll_fn(move |cx| connection.poll_message(cx));
 
     let conn_spawn = tokio::spawn(connection.for_each(move |r| {
