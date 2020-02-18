@@ -1,8 +1,5 @@
-use futures::channel::mpsc;
-
-use tokio::net::TcpStream;
-use tokio_postgres::{AsyncMessage, NoTls, Config, Client, Notification};
-use futures::{future, stream, FutureExt, StreamExt, TryStreamExt};
+use futures::{future, stream, StreamExt};
+use tokio_postgres::{AsyncMessage, Client, Config, NoTls};
 
 #[derive(Debug)]
 pub enum PsqlNotifyError {
@@ -22,46 +19,43 @@ impl From<tokio_postgres::error::Error> for PsqlNotifyError {
     }
 }
 
-pub async fn notify_listen<F>(socket_url: &str, config: &Config, mut notify_fn: F)
-    -> Result<Client, PsqlNotifyError>
-    where
-        F: FnMut(Notification) + Send + 'static,
-    {
+pub async fn notify_listen<F>(
+    execute_string: &str,
+    config: &Config,
+    mut notify_fn: F,
+) -> Result<Client, PsqlNotifyError>
+where
+    F: FnMut(AsyncMessage) + Send + 'static,
+{
+    let (client, mut connection) = config.connect(NoTls).await?;
+    let connection = stream::poll_fn(move |cx| connection.poll_message(cx));
 
-    let (sender, receiver) = mpsc::unbounded();
-    
-    let socket = TcpStream::connect(socket_url).await?;
-    let (client, mut connection) = config.connect_raw(socket, NoTls).await?;
-    let stream = stream::poll_fn(move |context| connection.poll_message(context)).map_err(|e| panic!(e));
-    let connection = stream.forward(sender).map(|r| r.unwrap());
+    let conn_spawn = tokio::spawn(connection.for_each(move |r| {
+        match r {
+            Ok(m) => notify_fn(m),
+            Err(e) => eprintln!("postgres connection error: {}", e),
+        }
 
-    let conn_spawn = tokio::spawn(connection);
+        future::ready(())
+    }));
 
-    client
-        .batch_execute("LISTEN test_messages; ")
-        .await
-        .unwrap();
-
-        let mut notifications = receiver
-        .filter_map(|m| match m {
-            AsyncMessage::Notification(n) => future::ready(Some(n)),
-            AsyncMessage::Notice(err) => {
-                println!("Notice: {:?}", err);
-                future::ready(None)
-            },
-            _ => future::ready(None),
-    });
-
-    
-    while let Some(notification) = notifications.next().await {
-        notify_fn(notification);
-    }
+    client.batch_execute(execute_string).await.unwrap();
 
     tokio::try_join!(conn_spawn).unwrap();
 
     Ok(client)
 }
 
-pub fn just_dbg(notification: Notification) {
-    dbg!(notification);    
+pub fn just_dbg(message: AsyncMessage) {
+    match message {
+        AsyncMessage::Notification(n) => {
+            dbg!(n);
+        }
+        AsyncMessage::Notice(err) => {
+            dbg!(err);
+        }
+        _ => {
+            eprintln!("new AsyncMessage");
+        }
+    };
 }
