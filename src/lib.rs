@@ -1,9 +1,11 @@
-use futures::{channel::mpsc, future, stream, FutureExt, StreamExt, TryStreamExt};
 use log::error;
-use std::sync::Arc;
 use tokio::task::JoinHandle;
+use futures::{
+    stream::BoxStream,
+    channel::mpsc, future, stream, StreamExt
+};
 use tokio_postgres::{
-    tls::MakeTlsConnect, types::ToSql, AsyncMessage, Client, Config, Error, Notification, Socket,
+    tls::MakeTlsConnect, AsyncMessage, Client, Config, Error, Socket,
 };
 
 /// Convenience function for long-run processing of Postgres notifications.
@@ -11,8 +13,8 @@ use tokio_postgres::{
 /// and calls `batch_execute` on the provided `execute_string`.
 /// The spawned stream will run `notify_fn` on each `AsyncMessage`.
 ///
-/// There is no validation of any kind on `execute_string`. It is implied here that simply "LISTEN test_messages;" or
-/// similar will be sent, other execution is at your own risk.
+/// There is no validation of any kind on `execute_string`: this is the same as calling `bathc_execute` directly.
+/// It is implied here that simply "LISTEN test_messages;" or similar will be sent, other execution is at your own risk.
 pub async fn notify_listen_with_fn<T, F>(
     execute_string: &str,
     config: &Config,
@@ -49,15 +51,22 @@ where
     Ok(client)
 }
 
-pub async fn notification_stream<T>(
+/// Convenience function for long-run processing of Postgres notifications.
+/// Connects to the Postgres database with the provided `Config`, spawns a tokio runtime to listen for messages,
+/// and calls `batch_execute` on the provided `execute_string`.
+/// Returns the spawned stream of `AsyncMessage`s.
+///
+/// There is no validation of any kind on `execute_string`: this is the same as calling `bathc_execute` directly.
+/// It is implied here that simply "LISTEN test_messages;" or similar will be sent, other execution is at your own risk.
+pub async fn notify_stream<T>(
+    execute_string: &str,
     config: &Config,
     tls: T,
-    channels: &[&str],
 ) -> Result<
     (
         JoinHandle<()>,
+        BoxStream<'static, AsyncMessage>,
         Client,
-        impl futures::Stream<Item = Notification>,
     ),
     Error,
 >
@@ -67,45 +76,27 @@ where
     T::Stream: Send,
 {
     let (sender, receiver) = mpsc::unbounded();
-    let listen_channels: Arc<[String]> = channels.iter().map(|x| x.to_string()).collect();
 
     let (client, mut connection) = config.connect(tls).await?;
     let connection = stream::poll_fn(move |cx| connection.poll_message(cx));
-
-    let conn_spawn = tokio::spawn(connection.for_each(move |r| {
-        match r {
-            Ok(m) => {
-                sender.unbounded_send(m).expect("channel error");
-            }
-            Err(e) => error!("postgres connection error: {}", e),
+    
+    let conn_spawn = tokio::spawn(connection.for_each(move |result| {
+        match result {
+            Ok(message) => {
+                match sender.unbounded_send(message) {
+                    Err(err) => {
+                        error!("channel send error: {}", err);
+                    },
+                    _ => {}
+                };
+            },
+            Err(err) => error!("postgres connection error: {}", err),
         }
 
         future::ready(())
     }));
 
-    client
-        .batch_execute(
-            &listen_channels
-                .iter()
-                .fold(String::new(), |mut acc, channel| {
-                    acc.push_str("LISTEN ");
-                    acc.push_str(&channel); // TODO: sanitize this
-                    acc.push_str(";");
-                    acc
-                }),
-        )
-        .await?;
+    client.batch_execute(execute_string).await?;
 
-    let notifications = receiver
-        .filter_map(|m| match m {
-            AsyncMessage::Notification(n) => future::ready(Some(n)),
-            AsyncMessage::Notice(err) => {
-                println!("Notice: {:?}", err);
-                future::ready(None)
-            }
-            _ => future::ready(None),
-        })
-        .filter(move |n| future::ready(listen_channels.iter().any(|c| n.channel() == c.as_str())));
-
-    Ok((conn_spawn, client, notifications))
+    Ok((conn_spawn, receiver.boxed(), client))
 }
