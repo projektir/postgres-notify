@@ -5,6 +5,9 @@ use postgres_notify::notify_listen_with_fn;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    std::env::set_var("RUST_LOG", "info");
+    env_logger::init();
+
     let config = "host=localhost user=some password=dummy dbname=testify"
         .parse::<Config>()
         .unwrap();
